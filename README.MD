@@ -1,15 +1,15 @@
 # Usage
 First terminal:
-```bash
+```shell
 roscore
 ```
 
 Second terminal: 
-```bash
+```shell
 rviz -d </path/to/carla_hdmap_visualization>/visualization.rviz
 ```
 
 Third terminal:
-```bash
+```shell
 rosbag play <bagfile>.bag
 ```
