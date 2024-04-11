@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 # coding=utf-8
 import copy
-import glob
-import os
 import sys
+
+from cv_bridge import CvBridge
 
 sys.path.insert(0, '/home/hvt/Code/ros_py3_ws/devel/lib/python3/dist-packages')
 
@@ -14,28 +14,21 @@ import argparse
 import cv2
 import rospy
 import ros_numpy
-from sensor_msgs.msg import PointCloud2, CompressedImage, Image
+from sensor_msgs.msg import PointCloud2, Image, CompressedImage
 from geometry_msgs.msg import TransformStamped, Vector3, Quaternion
 from nav_msgs.msg import Odometry
+from visualization_msgs.msg import Marker, MarkerArray
 import tf2_ros
 
-try:
-    from queue import Queue
-    from queue import Empty
-except ImportError:
-    from Queue import Queue
-    from Queue import Empty
-from matplotlib import cm, pyplot as plt
+from queue import Queue
+from queue import Empty
+from matplotlib import cm
 
 import numpy as np
 import numpy.linalg as LA
 
-import open3d as o3d
-import cv2 as cv
 import utilities as U
-
-VIRIDIS = np.array(cm.get_cmap('viridis').colors)
-VID_RANGE = np.linspace(0.0, 1.0, VIRIDIS.shape[0])
+from scipy.spatial import cKDTree
 
 
 class RosBridge:
@@ -46,18 +39,58 @@ class RosBridge:
         rospy.loginfo('Init......')
         self.rate = rospy.Rate(rate)
 
+        self.cv_bridge = CvBridge()
+
         self.br = tf2_ros.TransformBroadcaster()
 
         self.pub_hdmap = rospy.Publisher('/HDmap', PointCloud2, queue_size=10)
+        self.pub_hdmap_body = rospy.Publisher('/HDmap_body', PointCloud2, queue_size=10)
         self.pub_pc = rospy.Publisher('/pc', PointCloud2, queue_size=10)
         self.pub_img = rospy.Publisher('/Image', Image, queue_size=10)
+        self.pub_img_compressed = rospy.Publisher('/Image/compressed', CompressedImage, queue_size=10)
         self.pub_odom = rospy.Publisher('/Odometry', Odometry, queue_size=10)
         self.pub_info = rospy.Publisher('/Info', Image, queue_size=10)
+        self.pub_info_compressed = rospy.Publisher('/Info/compressed', CompressedImage, queue_size=10)
+        self.pub_infra = rospy.Publisher('/Infra', PointCloud2, queue_size=10)
+        self.pub_infra_marker = rospy.Publisher('/Infra_marker', MarkerArray, queue_size=10)
 
-        self.info_image = generate_info_image()
+        self.info_image_msg = self.generate_info_image()
+
+    def generate_info_image(self):
+        # 创建一个黑色背景图像
+        img = np.zeros((140, 320, 3), dtype=np.uint8)
+
+        # 定义图例项的颜色和标签
+        legend_items = [
+            ((255, 0, 0), "Vehicle HD Map"),
+            ((0, 255, 0), "Infrastructure HD Map"),
+            ((128, 128, 128), "Current Frame"),
+            ((96, 255, 249), "Vehicle Trajectory"),
+        ]
+
+        # 设置起始位置
+        start_x = 10
+        start_y = 5
+        offset_y = 35
+
+        # 遍历每个图例项，绘制颜色方块和文本
+        for color, label in legend_items:
+            color = tuple(list(color)[::-1])
+            # 绘制颜色方块
+            cv2.rectangle(img, (start_x, start_y), (start_x + 20, start_y + 20), color, -1)
+
+            # 绘制文本
+            cv2.putText(img, label, (start_x + 30, start_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # 更新下一个图例项的Y位置
+            start_y += offset_y
+
+        # compressed image
+        img_msg = self.cv_bridge.cv2_to_compressed_imgmsg(img, dst_format='jpeg')
+        return img_msg
 
     def update_timestamp(self):
-        self.timestamp = rospy.Time().to_sec()
+        self.timestamp = rospy.Time().now().to_sec()
 
     def publish_image(self, camera_data):
         # process camera data
@@ -65,21 +98,102 @@ class RosBridge:
         im_array = np.reshape(im_array, (camera_data.height, camera_data.width, 4))
         # im_array = im_array[:, :, :3][:, :, ::-1]
         im_array = im_array[:, :, :3]
-        img_msg = ros_numpy.image.numpy_to_image(im_array, encoding='bgr8')
-        img_msg.header.stamp = rospy.Time().from_sec(self.timestamp)
-        self.pub_img.publish(img_msg)
 
-    def publish_map(self, hd_map_frame, cur_frame):
+        # image
+        # img_msg = ros_numpy.image.numpy_to_image(im_array, encoding='bgr8')
+        # img_msg.header.stamp = rospy.Time().from_sec(self.timestamp)
+
+        # compressed image
+        img_msg = self.cv_bridge.cv2_to_compressed_imgmsg(im_array, dst_format='jpeg')
+        img_msg.header.stamp = rospy.Time().from_sec(self.timestamp)
+
+        self.pub_img_compressed.publish(img_msg)
+
+    def publish_map(self, hd_map_frame, hd_map_frame_body, cur_frame):
         hd_msg = U.to_ros_pc2_msg(hd_map_frame, self.timestamp, frame_id='world')
         self.pub_hdmap.publish(hd_msg)
+
+        hd_body_msg = U.to_ros_pc2_msg(hd_map_frame_body, self.timestamp, frame_id='world')
+        self.pub_hdmap_body.publish(hd_body_msg)
 
         cur_pc_msg = U.to_ros_pc2_msg(cur_frame, self.timestamp, frame_id='world')
         self.pub_pc.publish(cur_pc_msg)
 
+    def publish_infrastructure(self, infra_pc, center, clear=False):
+        if clear:
+            self.pub_infra.publish(PointCloud2())
+            self.pub_infra_marker.publish(MarkerArray())
+            return
+        infra_msg = U.to_ros_pc2_msg(infra_pc, self.timestamp, frame_id='world')
+        self.pub_infra.publish(infra_msg)
+
+        # infrastructure markers
+        marker_array = MarkerArray()
+        # offset
+        positions = [center - [10, 10, 0]]
+        for idx, position in enumerate(positions):
+            marker = Marker()
+            marker.header.frame_id = '/world'  # 注意：这里应该使用你的参考坐标系
+            marker.header.stamp = rospy.Time().from_sec(self.timestamp)
+            marker.ns = "cylinders"
+            marker.id = idx
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+
+            height = 20
+            # pose
+            marker.pose.position.x = position[0]
+            marker.pose.position.y = position[1]
+            marker.pose.position.z = position[2] + height / 2
+            marker.pose.orientation.x = 0
+            marker.pose.orientation.y = 0
+            marker.pose.orientation.z = 0
+            marker.pose.orientation.w = 1
+
+            # size
+            marker.scale.x = 1.0  # 圆柱体的直径
+            marker.scale.y = 1.0  # 圆柱体的直径
+            marker.scale.z = height  # 圆柱体的高度
+
+            # 设置圆柱体的颜色和透明度
+            marker.color.r = 0.0
+            marker.color.g = 1.0
+            marker.color.b = 0.0
+            marker.color.a = 1.0  # Alpha 1.0 表示完全不透明
+
+            # 将marker添加到MarkerArray中
+            marker_array.markers.append(marker)
+
+            # 创建文本Marker
+            text_marker = Marker()
+            text_marker.header = marker.header
+            text_marker.ns = "cylinder_texts"
+            text_marker.id = idx + 100  # 确保ID唯一
+            text_marker.type = Marker.TEXT_VIEW_FACING
+            text_marker.action = Marker.ADD
+
+            # 设置文本的位置（在圆柱体的顶部）
+            text_marker.pose.position.x = position[0]
+            text_marker.pose.position.y = position[1]
+            text_marker.pose.position.z = position[2] + height * 1.2  # 假设圆柱体高度为1，我们将文本放在顶部稍微高一点的位置
+            text_marker.scale.z = 8.0  # 文本的高度
+
+            # 设置文本的内容和颜色
+            text_marker.text = 'Infrastructure'
+            text_marker.color.r = 1.0
+            text_marker.color.g = 1.0
+            text_marker.color.b = 1.0
+            text_marker.color.a = 1.0  # 不透明
+
+            # 添加文本Marker到MarkerArray
+            marker_array.markers.append(text_marker)
+        self.pub_infra_marker.publish(marker_array)
+
     def publish_info(self):
-        info_msg = ros_numpy.image.numpy_to_image(self.info_image, encoding='bgr8')
-        info_msg.header.stamp = rospy.Time().from_sec(self.timestamp)
-        self.pub_info.publish(info_msg)
+        # info_msg = ros_numpy.image.numpy_to_image(self.info_image, encoding='bgr8')
+        # info_msg.header.stamp = rospy.Time().from_sec(self.timestamp)
+        self.info_image_msg.header.stamp = rospy.Time().from_sec(self.timestamp)
+        self.pub_info_compressed.publish(self.info_image_msg)
 
     def publish_odom(self, T__world__o__lidar):
         # publish transform
@@ -142,12 +256,13 @@ def process_semantic_lidar(lidar_data, T__world__o__lidar):
     )]
 
     # transform point cloud to world
+    hd_map_frame_body = copy.copy(hd_map_frame)
     hd_map_frame[:, :3] = U.compose(T__world__o__lidar, hd_map_frame)[:, :3]
     cur_frame[:, :3] = U.compose(T__world__o__lidar, cur_frame)[:, :3]
     # offset to highlight the hd map
     cur_frame[:, 2] -= 0.5
 
-    return hd_map_frame, cur_frame
+    return hd_map_frame, hd_map_frame_body, cur_frame
 
 
 def sensor_callback(data, queue):
@@ -161,11 +276,14 @@ def sensor_callback(data, queue):
 def hd_mapping(args):
     # ================================================================================================================
     # Init ros
-
     ros_bridge = RosBridge()
 
     # ================================================================================================================
-    # Init Controller
+    # Init infrastructure
+    if args.infrastructure:
+        infra_idx_list, infra_center_list, infra_pc_list \
+            = U.pickle_load('./data/infrastructure.pkl')
+        kdtree = cKDTree(np.array(infra_center_list))
 
     # ================================================================================================================
     # Init Carla
@@ -210,6 +328,7 @@ def hd_mapping(args):
             actor.set_state(carla.TrafficLightState.Green)
             # actor.set_red_time(5.0)
             actor.set_green_time(50000.0)
+            # actor.set_green_time(1.0)
             # actor_.set_yellow_time(1000.0)
 
     vehicle = None
@@ -246,7 +365,7 @@ def hd_mapping(args):
         vehicle = world.spawn_actor(
             blueprint=vehicle_bp,
             transform=world.get_map().get_spawn_points()[0])
-        vehicle.set_autopilot(True)
+        vehicle.set_autopilot(False)
 
         # set autopilot properties
         traffic_manager.auto_lane_change(vehicle, True)
@@ -308,13 +427,28 @@ def hd_mapping(args):
 
             # process semantic lidar data
             T__world__o__lidar = U.create_se3_matrix_from_carla_transformation(vehicle_lidar.get_transform())
-            hd_map_frame, cur_frame = process_semantic_lidar(lidar_data, T__world__o__lidar)
+            hd_map_frame, hd_map_frame_body, cur_frame = process_semantic_lidar(lidar_data, T__world__o__lidar)
 
             ros_bridge.update_timestamp()
-            ros_bridge.publish_map(hd_map_frame, cur_frame)
+            ros_bridge.publish_map(hd_map_frame, hd_map_frame_body, cur_frame)
             ros_bridge.publish_image(camera_data)
             ros_bridge.publish_info()
             ros_bridge.publish_odom(T__world__o__lidar)
+
+            if args.infrastructure:
+                # query infrastructure
+                current_location = T__world__o__lidar[:3, 3]
+                # kdtree query
+                dist, infra_idx = kdtree.query(current_location)
+                # filter infrastructure too far away
+                if dist < 35:
+                    infra_pc = copy.copy(infra_pc_list[infra_idx])
+                    infra_center = copy.copy(infra_center_list[infra_idx])
+                    print(dist, infra_idx)
+                    infra_pc[:, 2] += 0.5
+                    ros_bridge.publish_infrastructure(infra_pc, infra_center)
+                else:
+                    ros_bridge.publish_infrastructure(None, None, clear=True)
 
             # cv2.imshow('camera', im_array)
             # cv2.waitKey(1)
@@ -352,36 +486,6 @@ def hd_mapping(args):
             vehicle_lidar.destroy()
         if vehicle:
             vehicle.destroy()
-
-
-def generate_info_image():
-    # 创建一个黑色背景图像
-    img = np.zeros((140, 320, 3), dtype=np.uint8)
-
-    # 定义图例项的颜色和标签
-    legend_items = [
-        ((255, 0, 0), "HD Map"),
-        ((128, 128, 128), "Current Frame"),
-        ((96, 255, 249), "Vehicle Trajectory"),
-    ]
-
-    # 设置起始位置
-    start_x = 10
-    start_y = 20
-    offset_y = 40
-
-    # 遍历每个图例项，绘制颜色方块和文本
-    for color, label in legend_items:
-        color = tuple(list(color)[::-1])
-        # 绘制颜色方块
-        cv2.rectangle(img, (start_x, start_y), (start_x + 20, start_y + 20), color, -1)
-
-        # 绘制文本
-        cv2.putText(img, label, (start_x + 30, start_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-
-        # 更新下一个图例项的Y位置
-        start_y += offset_y
-    return img
 
 
 def main():
@@ -450,6 +554,10 @@ def main():
         default='100000',
         type=int,
         help='lidar points per second (default: 100000)')
+    argparser.add_argument(
+        '--infrastructure',
+        action='store_true',
+        help='Enable infrastructure')
     args = argparser.parse_args()
     args.width, args.height = [int(x) for x in args.res.split('x')]
     args.dot_extent -= 1
