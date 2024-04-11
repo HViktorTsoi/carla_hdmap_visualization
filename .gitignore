@@ -4,4 +4,4 @@ cmake-build-debug
 hdmap
 annotation
 /infrastructure/
-data/*
+data/*.bag
